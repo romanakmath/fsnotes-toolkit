@@ -150,6 +150,40 @@ local function instantTitle(d, url)
   return nil
 end
 
+-- Rich-clipboard paste (Recall/YouTube timestamps, any Chromium web-app copy):
+-- the plain-text flavor is the skeleton; the HTML flavor carries the anchors.
+-- Replace each anchor's visible text with [text](href) — local, instant.
+local function stripZeroWidth(s)
+  return (s:gsub("\226\128\139", ""):gsub("\239\187\191", ""))
+end
+
+local function anchorLinks(html)
+  local links = {}
+  for attrs, inner in html:gmatch("<[Aa]%s([^>]-)>(.-)</[Aa]>") do
+    local href = attrs:match('[Hh][Rr][Ee][Ff]="([^"]-)"')
+    if href and href:match("^https?://") then
+      local text = stripZeroWidth(decodeEntities(inner:gsub("<[^>]->", "")))
+      text = text:gsub("^%s+", ""):gsub("%s+$", "")
+      if text ~= "" then links[#links + 1] = { text = text, href = decodeEntities(href) } end
+    end
+  end
+  return links
+end
+
+local function applyLinks(text, links)
+  local out, consumed = text, 0
+  for _, L in ipairs(links) do
+    local esc = L.text:gsub("%[", "\\["):gsub("%]", "\\]")
+    local link = (L.href:find("[()]") or L.href:find(" ")) and ("<" .. L.href .. ">") or L.href
+    local md = "[" .. esc .. "](" .. link .. ")"
+    local pat = L.text:gsub("%W", "%%%0")          -- escape as Lua pattern
+    local repl = md:gsub("%%", "%%%%")              -- escape as replacement
+    local new, n = out:gsub(pat, repl, 1)            -- first occurrence only
+    if n > 0 then out, consumed = new, consumed + 1 end
+  end
+  return out, consumed, #links
+end
+
 -- ------------------------- delivery -------------------------
 
 local fetching = false  -- one fetch at a time
@@ -232,6 +266,23 @@ end
 -- ------------------------- test hook (terminal, no keystrokes) -------------------------
 
 MDLink = {}
+-- read-only: convert the current rich clipboard exactly as ⌘⇧V would
+function MDLink.richPreview()
+  local d = hs.pasteboard.readAllData()
+  local html = d["public.html"] or d["text/html"]
+  if type(html) ~= "string" then return nil, "no html flavor" end
+  local links = anchorLinks(html)
+  if #links == 0 then return nil, "no links" end
+  return applyLinks(hs.pasteboard.readString() or "", links)
+end
+
+-- pure: convert arbitrary (html, plainText) — used by richPreview and tests
+function MDLink.richConvert(html, text)
+  local links = anchorLinks(html)
+  if #links == 0 then return nil, "no links" end
+  return applyLinks(text, links)
+end
+
 function MDLink.test(url, deliver)
   if fetching then logf("TEST ignored: fetch in flight") return end
   fetching = true
@@ -255,7 +306,36 @@ mdlinkHotkey = hs.hotkey.new({"cmd", "shift"}, "v", function()
   end
 
   if not url then
-    -- not a URL: insert the clipboard text directly (small text) or native ⌘V
+    -- rich clipboard with links (e.g. Recall transcripts with YouTube
+    -- timestamps): convert anchors to markdown locally — Noteplan-style
+    local html = d["public.html"] or d["text/html"]
+    if type(html) == "string" and html:find("[Hh][Rr][Ee][Ff]=") then
+      local links = anchorLinks(html)
+      if #links > 0 then
+        local text = hs.pasteboard.readString() or ""
+        local md, consumed, total = applyLinks(text, links)
+        if consumed > 0 then
+          local ok = axInsert(md)
+          logf(("PASTED-ax src=richlinks %d/%d links %dms"):format(consumed, total, nowMs() - t0))
+          if ok then return end
+          logf("richlinks AX failed → clipboard fallback")
+          -- clipboard fallback: same race-safe path as deliverMd
+          local saved = hs.pasteboard.readString()
+          hs.pasteboard.setContents(md)
+          hs.timer.doAfter(0.05, function()
+            waitModsThen(function()
+              hs.eventtap.keyStroke({"cmd"}, "v", 0)
+              logf("PASTED-fallback src=richlinks " .. (nowMs() - t0) .. "ms")
+              hs.timer.doAfter(1.5, function()
+                guard("restore", function() hs.pasteboard.setContents(saved) end)
+              end)
+            end, "paste")
+          end)
+          return
+        end
+      end
+    end
+    -- not rich: insert the clipboard text directly (small text) or native ⌘V
     local text = hs.pasteboard.readString() or ""
     if text ~= "" and #text <= 2000 then
       local ok = axInsert(text)

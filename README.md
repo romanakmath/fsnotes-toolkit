@@ -8,6 +8,10 @@ FSNotes has no built-in "paste link as markdown". [Noteplan](https://noteplan.co
 
 Press **⌘⇧V** in FSNotes with a URL on the clipboard → a markdown link with the real page title lands at your cursor.
 
+## 🔗 rich-paste: Chromium web-app copies keep their links
+
+Copying from web apps (e.g. [Recall](https://recall.wiki) transcripts with YouTube timestamps) puts the *plain text* on the clipboard while the actual link lives only in the `public.html` flavor — so FSNotes pastes a bare `00:27`. ⌘⇧V detects anchors in the HTML flavor and surgically replaces their visible text in the plain text: `[00:27](https://…&t=27s)` — fully local, instant, byte-identical to Noteplan's paste.
+
 ### How the title is resolved (fastest first)
 
 | Path | Latency | When |
