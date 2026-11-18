@@ -8,6 +8,15 @@ FSNotes has no built-in "paste link as markdown". [Noteplan](https://noteplan.co
 
 Press **⌘⇧V** in FSNotes with a URL on the clipboard → a markdown link with the real page title lands at your cursor.
 
+## 🗂️ outline: ⌘⇧O summons the note's structure
+
+FSNotes has no outline panel (verified: its View menu offers none). ⌘⇧O in
+FSNotes opens a fuzzy-searchable overlay of the current note's markdown
+headings, indented by level; pick one and the editor jumps there — the
+heading line is selected via `AXSelectedTextRange`, which scrolls it into
+view. Works through Cyrillic/emoji content: AX offsets are UTF-16 while Lua
+strings are UTF-8, so offsets are tracked in UTF-16 explicitly.
+
 ## 🔗 rich-paste: Chromium web-app copies keep their links
 
 Copying from web apps (e.g. [Recall](https://recall.wiki) transcripts with YouTube timestamps) puts the *plain text* on the clipboard while the actual link lives only in the `public.html` flavor — so FSNotes pastes a bare `00:27`. ⌘⇧V detects anchors in the HTML flavor and surgically replaces their visible text in the plain text: `[00:27](https://…&t=27s)` — fully local, instant, byte-identical to Noteplan's paste.

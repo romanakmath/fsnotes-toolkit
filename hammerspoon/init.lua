@@ -368,16 +368,166 @@ mdlinkHotkey = hs.hotkey.new({"cmd", "shift"}, "v", function()
   end
 end)
 
+-- ------------------------- outline navigator (⌘⇧O) -------------------------
+-- Noteplan-style document structure for FSNotes: summon a fuzzy-searchable
+-- overlay of the note's markdown headings; selecting one jumps the editor
+-- there (AXSelectedTextRange — selects the heading line and scrolls; the
+-- same AX primitive as our text insertion: no synthetic keystrokes).
+-- NB: AX text offsets are UTF-16 units, Lua strings are UTF-8 bytes (Cyrillic
+-- notes!) — offsets are tracked in UTF-16 explicitly below.
+
+local function utf16len(s)
+  local ok, n = pcall(function()
+    local count = 0
+    for _, cp in utf8.codes(s) do count = count + (cp >= 0x10000 and 2 or 1) end
+    return count
+  end)
+  return ok and n or #s   -- invalid UTF-8: byte length is the least-wrong guess
+end
+
+local function outlineEditor()
+  local axok, ax = pcall(require, "hs.axuielement")
+  if not axok then return nil end
+  local app = hs.application.get(FSNOTES_BUNDLE_ID)
+  local win = app and app:focusedWindow()
+  if not win then return nil end
+  local root = ax.windowElement(win)
+  local best, bestLen = nil, -1
+  local function walk(e, depth)
+    if depth > 12 then return end
+    local okr, role = pcall(function() return e:attributeValue("AXRole") end)
+    if okr and role == "AXTextArea" then
+      local okv, v = pcall(function() return e:attributeValue("AXValue") end)
+      if okv and type(v) == "string" and #v > bestLen then best, bestLen = e, #v end
+    end
+    local okc, kids = pcall(function() return e:attributeValue("AXChildren") end)
+    if okc and type(kids) == "table" then for _, k in ipairs(kids) do walk(k, depth + 1) end end
+  end
+  pcall(walk, root, 0)
+  return best   -- the biggest text area in the window = the note editor
+end
+
+-- Lua patterns have no {m,n} quantifier (learned live: #{1,6} is literal) —
+-- use #+ and clamp the level. Code fences are skipped.
+local function parseHeadings(text)
+  local heads = {}
+  local u16, inFence, lineNo = 0, false, 0
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lineNo = lineNo + 1
+    if line:match("^%s*```") then inFence = not inFence end
+    if not inFence then
+      local hashes, title = line:match("^(#+)%s+(.-)%s*$")
+      if hashes and #hashes <= 6 and title ~= "" then
+        heads[#heads + 1] = {
+          level = #hashes, text = title, line = lineNo,
+          u16loc = u16, u16len = utf16len(line),
+        }
+      end
+    end
+    u16 = u16 + utf16len(line) + 1
+  end
+  return heads
+end
+
+local outlineEditorEl, outlineRows
+
+outlineChooser = hs.chooser.new(function(choice)
+  if not choice or not choice._h then return end   -- Esc / stale
+  local h, el = choice._h, outlineEditorEl
+  if el then
+    pcall(function()
+      el:setAttributeValue("AXSelectedTextRange", { location = h.u16loc, length = h.u16len })
+    end)
+    logf(("OUTLINE jump L%d H%d %q u16=%d"):format(h.line, h.level, h.text:sub(1, 50), h.u16loc))
+  end
+end)
+outlineChooser:queryChangedCallback(function(q)
+  guard("outline-filter", function()
+    if q == "" then outlineChooser:choices(outlineRows); return end
+    local filtered = {}
+    local ql = q:lower()
+    for _, row in ipairs(outlineRows) do      -- subsequence fuzzy match
+      local txt, i, j = row.text:lower(), 1, 1
+      while i <= #ql and j <= #txt do
+        if ql:sub(i, i) == txt:sub(j, j) then i = i + 1 end
+        j = j + 1
+      end
+      if i > #ql then filtered[#filtered + 1] = row end
+    end
+    outlineChooser:choices(filtered)
+  end)
+end)
+outlineChooser:placeholderText("Jump to heading…  (Esc to cancel)")
+outlineChooser:rows(15)
+outlineChooser:bgDark(true)
+
+local function outlineShow()
+  local t0 = nowMs()
+  local el = outlineEditor()
+  if not el then hs.alert.show("Outline: no editor found", 0.6); logf("OUTLINE: editor not found") return end
+  local text = el:attributeValue("AXValue")
+  local heads = parseHeadings(text or "")
+  if #heads == 0 then hs.alert.show("No headings in this note", 0.6); logf("OUTLINE: 0 headings " .. (nowMs() - t0) .. "ms") return end
+  outlineEditorEl = el
+  outlineRows = {}
+  for _, h in ipairs(heads) do
+    outlineRows[#outlineRows + 1] = {
+      text = string.rep("    ", h.level - 1) .. h.text,
+      subText = ("H%d · line %d"):format(h.level, h.line),
+      _h = h,
+    }
+  end
+  outlineChooser:choices(outlineRows)
+  outlineChooser:query("")
+  outlineChooser:show()
+  logf(("OUTLINE shown: %d headings, parse %dms"):format(#heads, nowMs() - t0))
+end
+
+outlineHotkey = hs.hotkey.new({"cmd", "shift"}, "o", function() guard("outline-show", outlineShow) end)
+
+-- terminal/test hooks (no keystrokes): MDOutline.probe() / .show() / .jumpLast()
+MDOutline = {}
+function MDOutline.probe()
+  local el = outlineEditor()
+  if not el then return "no editor" end
+  local heads = parseHeadings(el:attributeValue("AXValue") or "")
+  local first = heads[1] and ('L' .. heads[1].line .. " " .. heads[1].text) or "-"
+  local last = heads[#heads] and ('L' .. heads[#heads].line .. " " .. heads[#heads].text) or "-"
+  return #heads .. " headings | first: " .. first .. " | last: " .. last
+end
+function MDOutline.show() outlineShow() end
+function MDOutline.jumpLast()
+  local el = outlineEditor()
+  if not el then return "no editor" end
+  local heads = parseHeadings(el:attributeValue("AXValue") or "")
+  local h = heads[#heads]
+  if not h then return "no headings" end
+  el:setAttributeValue("AXSelectedTextRange", { location = h.u16loc, length = h.u16len })
+  local sel = el:attributeValue("AXSelectedText")
+  local vis = el:attributeValue("AXVisibleCharacterRange")
+  local visible = vis and vis.location <= h.u16loc and (h.u16loc + h.u16len) <= (vis.location + vis.length)
+  return string.format("jumped L%d %q | sel=%q | visible after: %s", h.line, h.text:sub(1, 40),
+                       (sel or "?"):sub(1, 30), tostring(visible))
+end
+
+-- ------------------------- hotkey scoping -------------------------
+
 local fsNotesActive = false
 local function syncHotkey()
   local front = hs.application.frontmostApplication()
   local active = (front and front:bundleID() == FSNOTES_BUNDLE_ID) or false
   if active ~= fsNotesActive then
-    logf("frontmost → " .. (active and "FSNotes (hotkey ENABLED)" or
-         ((front and front:bundleID() or "?") .. " (hotkey disabled)")))
+    logf("frontmost → " .. (active and "FSNotes (hotkeys ENABLED: ⌘⇧V ⌘⇧O)" or
+         ((front and front:bundleID() or "?") .. " (hotkeys disabled)")))
     fsNotesActive = active
   end
-  if active then mdlinkHotkey:enable() else mdlinkHotkey:disable() end
+  if active then
+    mdlinkHotkey:enable()
+    outlineHotkey:enable()
+  else
+    mdlinkHotkey:disable()
+    outlineHotkey:disable()
+  end
 end
 
 appWatcher = hs.application.watcher.new(function(_, event, app)
@@ -386,4 +536,4 @@ end)
 appWatcher:start()
 
 syncHotkey()
-logf("=== config loaded: recorder + hotkey (AX-insert delivery, tap watchdog) ===")
+logf("=== config loaded: recorder + hotkeys (⌘⇧V md-paste, ⌘⇧O outline) ===")
