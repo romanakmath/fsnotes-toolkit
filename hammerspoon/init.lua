@@ -1,0 +1,309 @@
+-- ⌘⇧V in FSNotes: paste clipboard URL as a Markdown link [Title](url)
+--
+-- Title resolution mirrors Noteplan (its binary references
+-- WebURLsWithTitlesPboardType — it reads the title from the pasteboard):
+--   1. INSTANT  pasteboard already has a title (public.url-name, html anchor,
+--               WebURLsWithTitlesPboardType) → no network.
+--   2. CACHE    URL pasted before (10 min) → no network.
+--   3. FETCH    plain-text URL only → background curl → temp file (HS 1.1.1
+--               bug: hs.task callbacks die on large child stdout), 3s cap,
+--               hostname fallback. Visible 🔗 indicator while fetching.
+--
+-- DELIVERY (the important part): AXSelectedText insertion — the text is
+-- written straight into the focused editor via the Accessibility API.
+-- No synthetic keystrokes, no clipboard swap, no modifier coupling (held
+-- ⌘⇧), no keyboard layout issues, no propagation races. Clipboard and
+-- ⌘V-synthesis are only used as a rare fallback when AX is not settable.
+--
+-- Flight recorder: /tmp/hs-mdlink.log (ms timestamps, every press + path).
+-- Test hook (terminal): hs -c 'MDLink.test("https://…")'
+
+local FSNOTES_BUNDLE_ID = "co.fluder.FSNotes"
+local LOG    = "/tmp/hs-mdlink.log"
+local UA     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+require("hs.ipc")  -- ground-truth checks from terminal:  hs -c '...'
+
+local function logf(msg)
+  local f = io.open(LOG, "a")
+  if f then
+    local s = hs.timer.secondsSinceEpoch()
+    f:write(os.date("%H:%M:%S", math.floor(s)) .. string.format(".%03d", math.floor((s % 1) * 1000)) .. " " .. msg .. "\n"); f:close()
+  end
+end
+
+local function nowMs() return math.floor(hs.timer.secondsSinceEpoch() * 1000) end
+
+-- run fn(args) safely; Lua errors land in the flight recorder, not the void
+local function guard(what, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then logf("CALLBACK ERROR (" .. what .. "): " .. tostring(err)) end
+end
+
+-- Live physical-modifier state (updated by the recorder tap). Only needed by
+-- the rare clipboard-fallback path: a synthetic ⌘V posted while the user
+-- still holds ⌘⇧ arrives as ⌘⇧V in the app (FSNotes: Duplicate — no paste).
+MODS = { cmd = false, shift = false }
+
+-- Passive global recorder: sees ⌘⇧V / ⌘⇧D presses in ANY app.
+-- MUST return nothing (nil) — returning true would CONSUME every keypress
+-- system-wide (learned the hard way: true = swallow, nil = pass through).
+keyRecorder = hs.eventtap.new({hs.eventtap.event.types.keyDown, hs.eventtap.event.types.flagsChanged}, function(ev)
+  local flags = ev:getFlags()
+  MODS.cmd = flags.cmd or false
+  MODS.shift = flags.shift or false
+  if ev:getType() == hs.eventtap.event.types.keyDown then
+    local key = ev:getKeyCode()
+    if (key == hs.keycodes.map["v"] or key == hs.keycodes.map["d"]) and flags.cmd and flags.shift then
+      local front = hs.application.frontmostApplication()
+      logf("PRESS " .. (key == hs.keycodes.map["v"] and "⌘⇧V" or "⌘⇧D") ..
+           " seen by recorder | frontmost=" .. (front and front:bundleID() or "?"))
+    end
+  end
+  return nil  -- passive observer: never intercept anything
+end)
+keyRecorder:start()
+
+-- macOS can silently disable event taps (callback timeout); re-arm (same
+-- lesson as the dictation app's tap watchdog).
+tapWatchdog = hs.timer.doEvery(0.5, function()
+  if not keyRecorder:isEnabled() then
+    keyRecorder:start()
+    logf("recorder tap re-armed (macOS had disabled it)")
+  end
+end)
+
+-- wait until the user's physical ⌘/⇧ are released (or 1.5s timeout)
+local function waitModsThen(fn, tag)
+  local t0 = nowMs()
+  local function check()
+    if not (MODS.cmd or MODS.shift) or (nowMs() - t0) > 1500 then
+      hs.timer.doAfter(0.03, function()
+        guard(tag, function()
+          if nowMs() - t0 > 40 then
+            logf("mods wait " .. (nowMs() - t0) .. "ms" ..
+                 ((MODS.cmd or MODS.shift) and " (TIMED OUT — still held)" or ""))
+          end
+          fn()
+        end)
+      end)
+    else
+      hs.timer.doAfter(0.02, check)
+    end
+  end
+  check()
+end
+
+-- ------------------------- markdown link helpers -------------------------
+
+local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = " " }
+
+local function decodeEntities(s)
+  s = s:gsub("&#(%d+);",  function(n) return utf8.char(tonumber(n) or 63) end)
+  s = s:gsub("&#x(%x+);", function(n) return utf8.char(tonumber(n, 16) or 63) end)
+  for k, v in pairs(ENTITIES) do s = s:gsub("&" .. k .. ";", v) end
+  return s
+end
+
+local function cleanTitle(t)
+  t = t:gsub("\194\160", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  -- NB: Lua patterns have no | alternation — strip each brand separately
+  for _, brand in ipairs({ "YouTube", "GitHub", "Google", "Wikipedia" }) do
+    t = t:gsub("%s*[-|]%s*" .. brand .. "$", "")
+    t = t:gsub("%s*–%s*" .. brand .. "$", "")
+  end
+  return t
+end
+
+local function mdLink(title, url)
+  local esc = title:gsub("%[", "\\["):gsub("%]", "\\]")
+  local link = url
+  if url:find("[()]") or url:find(" ") then link = "<" .. url .. ">" end
+  return "[" .. esc .. "](" .. link .. ")"
+end
+
+local function hostname(url)
+  return (url:match("^https?://([^/%s]+)") or url):gsub("^www%.", "")
+end
+
+-- Title already sitting on the pasteboard? (Noteplan's instant path)
+local function instantTitle(d, url)
+  local function ok(raw)
+    if type(raw) ~= "string" then return nil end
+    local t = cleanTitle(decodeEntities(raw))
+    if t ~= "" and t ~= url and not t:match("^https?://") then return t end
+  end
+  local t = ok(d["public.url-name"]);              if t then return t, "url-name" end
+  local html = d["public.html"] or d["text/html"]  -- Chromium "Copy Link Address" writes an anchor
+  if html then
+    local label = html:match("<[Aa]%s+[^>]->(.-)</[Aa]>") or html:match("<[Aa][^>]->(.-)</[Aa]>")
+    t = ok(label);                                  if t then return t, "html-anchor" end
+  end
+  local wt = d["WebURLsWithTitlesPboardType"]       -- Safari: two arrays (urls, then titles)
+  if wt then
+    local strs = {}
+    for s in wt:gmatch("<string>(.-)</string>") do strs[#strs + 1] = decodeEntities(s) end
+    if #strs >= 2 then
+      t = ok(strs[math.floor(#strs / 2) + 1]);      if t then return t, "WebURLsWithTitles" end
+    end
+  end
+  return nil
+end
+
+-- ------------------------- delivery -------------------------
+
+local fetching = false  -- one fetch at a time
+local queued    = false  -- a press arrived mid-flight → one deferred delivery when ready
+local titleCache = {}    -- url -> { md = …, at = ms } (10 min TTL)
+
+-- Write text directly into the focused editor via Accessibility. The clean
+-- primitive: no keystrokes, no clipboard, no modifier/layout coupling.
+local function axInsert(text)
+  local okax, ax = pcall(require, "hs.axuielement")
+  if not okax then return false, "no hs.axuielement" end
+  local okel, el = pcall(function()
+    return ax.systemWideElement():attributeValue("AXFocusedUIElement")
+  end)
+  if not okel or not el then return false, "no focused element" end
+  local okset, err = pcall(function() el:setAttributeValue("AXSelectedText", text) end)
+  if not okset then return false, err end
+  return true
+end
+
+local function deliverMd(md, url, source, t0)
+  titleCache[url] = { md = md, at = nowMs() }
+
+  local ok, err = axInsert(md)
+  if ok then
+    fetching = false
+    logf(("PASTED-ax src=%s host=%s %dms | %s"):format(source, hostname(url), nowMs() - t0, md:sub(1, 90)))
+    if queued then  -- press(es) arrived while fetching: deliver once more
+      queued = false
+      hs.timer.doAfter(0.2, function()
+        guard("queued-ax", function()
+          axInsert(md)
+          logf("PASTED-ax (queued repeat) | " .. md:sub(1, 60))
+        end)
+      end)
+    end
+    return
+  end
+
+  -- Fallback (AX not settable in target app): clipboard swap + ⌘V after
+  -- modifier release. Preserved clipboard, race-delayed paste.
+  logf("AX insert failed (" .. tostring(err) .. ") → clipboard fallback")
+  local saved = hs.pasteboard.readString()
+  hs.pasteboard.setContents(md)
+  hs.timer.doAfter(0.05, function()
+    waitModsThen(function()
+      hs.eventtap.keyStroke({"cmd"}, "v", 0)
+      fetching = false
+      logf(("PASTED-fallback src=%s host=%s %dms | %s"):format(source, hostname(url), nowMs() - t0, md:sub(1, 90)))
+      hs.timer.doAfter(1.5, function()
+        guard("restore", function() hs.pasteboard.setContents(saved) end)
+      end)
+    end, "paste")
+  end)
+end
+
+local function fetchAndPaste(url, t0, deliver)
+  local tmp = "/tmp/hs-mdlink-page-" .. tostring(t0) .. ".html"
+  hs.task.new("/usr/bin/curl", function(code)
+    guard("curl", function()
+      local title = ""
+      if code == 0 then
+        local f = io.open(tmp, "r")
+        if f then
+          local data = f:read("*a"); f:close()
+          local m = data and data:match("<[Tt][Ii][Tt][Ll][Ee][^>]*>(.-)</[Tt][Ii][Tt][Ll][Ee]>")
+          if m then title = cleanTitle(decodeEntities(m)) end
+        end
+      end
+      os.remove(tmp)
+      if title == "" then title = hostname(url) end   -- never hang, never bare-URL
+      local md = mdLink(title, url)
+      local src = (code == 0) and "fetch" or ("fetch-fail:" .. tostring(code))
+      if deliver then deliverMd(md, url, src, t0)
+      else fetching = false; logf(("RESOLVE(no-paste) src=%s host=%s %dms | %s"):format(src, hostname(url), nowMs() - t0, md:sub(1, 90))) end
+    end)
+  end, { "-sL", "--compressed", "--max-time", "3", "-A", UA, "-o", tmp, url }):start()
+end
+
+-- ------------------------- test hook (terminal, no keystrokes) -------------------------
+
+MDLink = {}
+function MDLink.test(url, deliver)
+  if fetching then logf("TEST ignored: fetch in flight") return end
+  fetching = true
+  if deliver == nil then deliver = false end
+  local t0 = nowMs()
+  logf("TEST " .. url .. (deliver and " (deliver)" or " (resolve only)"))
+  fetchAndPaste(url, t0, deliver)
+end
+
+-- ------------------------- the hotkey -------------------------
+
+mdlinkHotkey = hs.hotkey.new({"cmd", "shift"}, "v", function()
+  local t0 = nowMs()
+  local d = hs.pasteboard.readAllData()
+
+  local url
+  if type(d["public.url"]) == "string" then url = d["public.url"]:match("^%s*(https?://%S+)%s*$") end
+  if not url then
+    local text = hs.pasteboard.readString() or ""
+    url = text:match("^%s*(https?://%S+)%s*$")  -- exactly one plain URL, else forward
+  end
+
+  if not url then
+    -- not a URL: insert the clipboard text directly (small text) or native ⌘V
+    local text = hs.pasteboard.readString() or ""
+    if text ~= "" and #text <= 2000 then
+      local ok = axInsert(text)
+      if ok then logf("FORWARD-ax (text inserted) " .. (nowMs() - t0) .. "ms") return end
+    end
+    waitModsThen(function()
+      hs.eventtap.keyStroke({"cmd"}, "v", 0)
+      logf("FORWARD native ⌘V " .. (nowMs() - t0) .. "ms")
+    end, "forward")
+    return
+  end
+
+  local title, src = instantTitle(d, url)
+  if title then
+    deliverMd(mdLink(title, url), url, "instant:" .. src, t0)   -- 0 network, like Noteplan
+    return
+  end
+
+  local c = titleCache[url]
+  if c and (nowMs() - c.at) < 600000 then
+    deliverMd(c.md, url, "cache", t0)                            -- seen before → 0ms
+  elseif fetching then
+    queued = true
+    logf("PRESS during fetch → queued (one delivery when ready)")
+  else
+    fetching = true
+    hs.alert.show("🔗 " .. hostname(url), 0.4)                   -- visible wait indicator
+    logf("HOTKEY url=" .. hostname(url) .. " → background fetch (3s cap)")
+    fetchAndPaste(url, t0, true)
+  end
+end)
+
+local fsNotesActive = false
+local function syncHotkey()
+  local front = hs.application.frontmostApplication()
+  local active = (front and front:bundleID() == FSNOTES_BUNDLE_ID) or false
+  if active ~= fsNotesActive then
+    logf("frontmost → " .. (active and "FSNotes (hotkey ENABLED)" or
+         ((front and front:bundleID() or "?") .. " (hotkey disabled)")))
+    fsNotesActive = active
+  end
+  if active then mdlinkHotkey:enable() else mdlinkHotkey:disable() end
+end
+
+appWatcher = hs.application.watcher.new(function(_, event, app)
+  if event == hs.application.watcher.activated and app then syncHotkey() end
+end)
+appWatcher:start()
+
+syncHotkey()
+logf("=== config loaded: recorder + hotkey (AX-insert delivery, tap watchdog) ===")
