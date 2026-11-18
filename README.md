@@ -17,6 +17,15 @@ heading line is selected via `AXSelectedTextRange`, which scrolls it into
 view. Works through Cyrillic/emoji content: AX offsets are UTF-16 while Lua
 strings are UTF-8, so offsets are tracked in UTF-16 explicitly.
 
+## 📊 html2md: ⌘⇧V keeps rich formatting from web apps
+
+Pasting AI-chat answers (Google AI/Gemini etc.) into FSNotes loses **bold**,
+*italics*, tables and lists — the plain-text flavor is all FSNotes sees.
+When the clipboard HTML contains structural markup, ⌘⇧V converts the whole
+HTML flavor to markdown: emphasis, `code`, `[links](…)`, headings, `---`,
+nested `ul`/`ol`, and `| tables |` with proper header separators. Local and
+instant, like Noteplan's paste.
+
 ## 🔗 rich-paste: Chromium web-app copies keep their links
 
 Copying from web apps (e.g. [Recall](https://recall.wiki) transcripts with YouTube timestamps) puts the *plain text* on the clipboard while the actual link lives only in the `public.html` flavor — so FSNotes pastes a bare `00:27`. ⌘⇧V detects anchors in the HTML flavor and surgically replaces their visible text in the plain text: `[00:27](https://…&t=27s)` — fully local, instant, byte-identical to Noteplan's paste.

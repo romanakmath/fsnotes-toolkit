@@ -184,6 +184,158 @@ local function applyLinks(text, links)
   return out, consumed, #links
 end
 
+-- ------------- HTML → Markdown (Google AI / structured rich copies) -------------
+-- What Noteplan does internally on ⌘V: Chromium puts the formatted content
+-- in the public.html flavor; convert it to markdown locally (instant).
+-- Handles: bold/italic/strike/inline-code, links, headings, hr, br,
+-- paragraphs, nested ul/ol, tables (th → header separator), code fences.
+-- Machine-serialized DOM only — not a general web-HTML parser.
+
+local function emphasisWrap(inner, marker)
+  local lead, body, trail = inner:match("^(%s*)(.-)(%s*)$")
+  if body == "" then return lead .. trail end
+  return lead .. marker .. body .. marker .. trail
+end
+
+local function inlinePass(h)
+  for _ = 1, 10 do   -- repeat until stable: nested inline elements
+    local before = h
+    h = h:gsub("<[Cc][Oo][Dd][Ee][^>]*>(.-)</[Cc][Oo][Dd][Ee]>", function(x)
+      x = x:gsub("^%s+", ""):gsub("%s+$", ""):gsub("<[^>]->", "")
+      if x == "" then return "" end
+      local q = x:find("`") and "``" or "`"
+      return q .. x .. q
+    end)
+    h = h:gsub("<[Ss][Tt][Rr][Oo][Nn][Gg][^>]*>(.-)</[Ss][Tt][Rr][Oo][Nn][Gg]>", function(x) return emphasisWrap(x, "**") end)
+    h = h:gsub("<[Bb]>(.-)</[Bb]>", function(x) return emphasisWrap(x, "**") end)
+    h = h:gsub("<[Bb]%s[^>]->(.-)</[Bb]>", function(x) return emphasisWrap(x, "**") end)
+    h = h:gsub("<[Ee][Mm][^>]*>(.-)</[Ee][Mm]>", function(x) return emphasisWrap(x, "*") end)
+    h = h:gsub("<[Ii]>(.-)</[Ii]>", function(x) return emphasisWrap(x, "*") end)
+    h = h:gsub("<[Ii]%s[^>]->(.-)</[Ii]>", function(x) return emphasisWrap(x, "*") end)
+    h = h:gsub("<[Dd][Ee][Ll][^>]*>(.-)</[Dd][Ee][Ll]>", function(x) return emphasisWrap(x, "~~") end)
+    h = h:gsub("<[Ss][^>]*>(.-)</[Ss]>", function(x) return emphasisWrap(x, "~~") end)  -- <s> (not <span>: requires space/attrs)
+    h = h:gsub("<[Aa]%s([^>]-)>(.-)</[Aa]>", function(attrs, x)
+      local href = attrs:match('[Hh][Rr][Ee][Ff]="([^"]*)"')
+      local label = stripZeroWidth(decodeEntities(x:gsub("<[^>]->", "")))
+        :gsub("^%s+", ""):gsub("%s+$", "")
+      if href and href:match("^https?://") and label ~= "" then
+        return mdLink(label, decodeEntities(href))
+      end
+      return x   -- named anchor / no href: keep inner content
+    end)
+    if h == before then break end
+  end
+  return h
+end
+
+local function cellText(cell)
+  cell = decodeEntities(cell:gsub("<[^>]->", ""))
+  cell = cell:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  return (cell:gsub("%|", "\\|"))   -- escape pipe: literal | would break the row
+end
+
+local function tablePass(h)
+  local function convert(t)
+    local rows, ncols, hasHeader = {}, 0, false
+    for tr in t:gmatch("<[Tt][Rr][^>]*>(.-)</[Tt][Rr]>") do
+      local cells = {}
+      for cell in tr:gmatch("<[Tt][Dd][^>]*>(.-)</[Tt][Dd]>") do cells[#cells + 1] = cellText(cell) end
+      local th = {}
+      for cell in tr:gmatch("<[Tt][Hh][^>]*>(.-)</[Tt][Hh]>") do th[#th + 1] = cellText(cell) end
+      if #th > 0 then
+        hasHeader, ncols = true, #th
+        rows[#rows + 1] = "| " .. table.concat(th, " | ") .. " |"
+      elseif #cells > 0 then
+        rows[#rows + 1] = "| " .. table.concat(cells, " | ") .. " |"
+      end
+    end
+    if #rows == 0 then return "" end
+    if hasHeader then
+      local sep = {}
+      for i = 1, math.max(ncols, 1) do sep[i] = "---" end
+      table.insert(rows, 2, "| " .. table.concat(sep, " | ") .. " |")
+    end
+    return "\n\n" .. table.concat(rows, "\n") .. "\n\n"
+  end
+  -- tables don't nest in clipboard DOM; convert each (incl. the tbody wrapper case)
+  h = h:gsub("<[Tt][Aa][Bb][Ll][Ee][^>]*>(.-)</[Tt][Aa][Bb][Ll][Ee]>", convert)
+  return h
+end
+
+local function listPass(h)
+  local function convertOne(body, ordered)
+    local items, n = {}, 0
+    for li in body:gmatch("<[Ll][Ii][^>]*>(.-)</[Ll][Ii]>") do
+      n = n + 1
+      local marker = ordered and (n .. ". ") or "- "
+      li = li:gsub("^%s+", ""):gsub("%s+$", "")
+      local lines = {}
+      for line in (li .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+      for i, line in ipairs(lines) do
+        lines[i] = (i == 1) and (marker .. line) or ("  " .. line)
+      end
+      items[#items + 1] = table.concat(lines, "\n")
+    end
+    return "\n\n" .. table.concat(items, "\n") .. "\n\n"
+  end
+  for _ = 1, 20 do   -- innermost list first (nested lists become md lines)
+    local before = h
+    h = h:gsub("<[Uu][Ll][^>]*>(.-)</[Uu][Ll]>", function(b)
+      if b:find("<[Uu][Ll]") or b:find("<[Oo][Ll]") then return nil end   -- not innermost: skip
+      return convertOne(b, false)
+    end)
+    h = h:gsub("<[Oo][Ll][^>]*>(.-)</[Oo][Ll]>", function(b)
+      if b:find("<[Uu][Ll]") or b:find("<[Oo][Ll]") then return nil end
+      return convertOne(b, true)
+    end)
+    if h == before then break end
+  end
+  return h
+end
+
+local function htmlToMarkdown(html)
+  html = html:gsub("<!%-%-.-%-%->", "")                          -- comments
+  html = html:gsub("<[Mm][Ee][Tt][Aa][^>]*>", "")
+  -- pull <pre> blocks out; reinsert as fences at the very end
+  local pres = {}
+  html = html:gsub("<[Pp][Rr][Ee][^>]*>(.-)</[Pp][Rr][Ee]>", function(x)
+    pres[#pres + 1] = decodeEntities(x:gsub("<[^>]->", "")):gsub("^%s+", ""):gsub("%s+$", "")
+    return "\n\n\194\166PRE" .. #pres .. "\194\166\n\n"
+  end)
+  html = inlinePass(html)
+  html = tablePass(html)
+  html = listPass(html)
+  -- block structure
+  html = html:gsub("<[Hh][Rr][^>]*>", "\n\n---\n\n")
+  html = html:gsub("<[Bb][Rr][^>]*>", "\n")
+  html = html:gsub("<[Hh]([1-6])[^>]*>(.-)</[Hh][1-6]>", function(lvl, x)
+    return "\n\n" .. string.rep("#", tonumber(lvl)) .. " " .. x:gsub("^%s+", ""):gsub("%s+$", "") .. "\n\n"
+  end)
+  html = html:gsub("<[Pp][^>]*>(.-)</[Pp]>", "\n\n%1\n\n")
+  html = html:gsub("</[Dd][Ii][Vv]>", "\n")
+  html = html:gsub("<[Dd][Ii][Vv][^>]*>", "\n")
+  -- reinsert code fences, strip remaining tags, decode entities
+  html = html:gsub("\194\166PRE(%d+)\194\166", function(n)
+    return "```\n" .. pres[tonumber(n)] .. "\n```"
+  end)
+  html = decodeEntities(html:gsub("<[^>]->", ""))
+  -- tidy: collapse runs, trim line-ends, collapse redundant emphasis
+  html = html:gsub("%*%*%*%*+", "**")
+  html = html:gsub("[ \t]+\n", "\n")
+  html = html:gsub("\n\n\n+", "\n\n")
+  return (html:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- structural HTML = rich formatting that plain text loses → full conversion;
+-- link-only HTML (Recall) keeps the anchor-surgery path (plain text is the
+-- better skeleton there: Chromium's own line breaks/punctuation).
+local function isStructural(html)
+  return html:find("<[Tt][Aa][Bb][Ll][Ee]") or html:find("<[Ss][Tt][Rr][Oo][Nn][Gg]")
+      or html:find("<[Bb][%s>]") or html:find("<[Ee][Mm][%s>]") or html:find("<[Ii][%s>]")
+      or html:find("<[Uu][Ll][%s>]") or html:find("<[Oo][Ll][%s>]") or html:find("<[Pp][Rr][Ee]")
+      or html:find("<[Hh][1-6]") or html:find("<[Hh][Rr][%s/>]") or html:find("<[Dd][Ee][Ll]")
+end
+
 -- ------------------------- delivery -------------------------
 
 local fetching = false  -- one fetch at a time
@@ -283,6 +435,12 @@ function MDLink.richConvert(html, text)
   return applyLinks(text, links)
 end
 
+-- pure: full structural HTML→markdown (Google AI test hook)
+function MDLink.richFull(html)
+  if not isStructural(html) then return nil, "not structural" end
+  return htmlToMarkdown(html)
+end
+
 function MDLink.test(url, deliver)
   if fetching then logf("TEST ignored: fetch in flight") return end
   fetching = true
@@ -306,7 +464,32 @@ mdlinkHotkey = hs.hotkey.new({"cmd", "shift"}, "v", function()
   end
 
   if not url then
-    -- rich clipboard with links (e.g. Recall transcripts with YouTube
+    -- STRUCTURAL rich clipboard (Google AI etc.): full HTML→markdown
+    -- conversion — bold/tables/lists/headings survive, like Noteplan's ⌘V
+    local html = d["public.html"] or d["text/html"]
+    if type(html) == "string" and isStructural(html) then
+      local t1 = nowMs()
+      local md = htmlToMarkdown(html)
+      if md and #md > 0 then
+        local ok = axInsert(md)
+        logf(("PASTED-ax src=html2md %d bytes → %d bytes %dms"):format(#html, #md, nowMs() - t1))
+        if ok then return end
+        logf("html2md AX failed → clipboard fallback")
+        local saved = hs.pasteboard.readString()
+        hs.pasteboard.setContents(md)
+        hs.timer.doAfter(0.05, function()
+          waitModsThen(function()
+            hs.eventtap.keyStroke({"cmd"}, "v", 0)
+            logf("PASTED-fallback src=html2md " .. (nowMs() - t0) .. "ms")
+            hs.timer.doAfter(1.5, function()
+              guard("restore", function() hs.pasteboard.setContents(saved) end)
+            end)
+          end, "paste")
+        end)
+        return
+      end
+    end
+    -- link-only rich clipboard (e.g. Recall transcripts with YouTube
     -- timestamps): convert anchors to markdown locally — Noteplan-style
     local html = d["public.html"] or d["text/html"]
     if type(html) == "string" and html:find("[Hh][Rr][Ee][Ff]=") then
